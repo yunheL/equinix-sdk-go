@@ -7,11 +7,16 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/equinix/equinix-sdk-go/services/securecabinetv1"
 
 	"github.com/equinix/equinix-sdk-go/extensions/equinixoauth2"
+	"github.com/hashicorp/go-retryablehttp"
 )
+
+const CORRELATION_ID = "securecab-example-7d4a8c5e"
 
 func main() {
 	// Parse command line flags
@@ -40,12 +45,24 @@ func main() {
 	}
 	authTransport := authConfig.New()
 
+	// Configure retry client
+	retryClient := retryablehttp.NewClient()
+	retryClient.HTTPClient.Transport = authTransport
+	retryClient.RetryWaitMin = time.Second
+	retryClient.RetryWaitMax = time.Second * 60
+	retryClient.Logger = log.New(os.Stdout, "", log.LstdFlags)
+	retryClient.RequestLogHook = func(logger retryablehttp.Logger, req *http.Request, retry int) {
+		if retry > 0 {
+			log.Printf("Retrying request (attempt %d) with wait time between %v and %v", retry+1, retryClient.RetryWaitMin, retryClient.RetryWaitMax)
+		}
+	}
+	standardClient := retryClient.StandardClient()
+
 	// Configure the Secure Cabinet client
 	configuration := securecabinetv1.NewConfiguration()
-	configuration.HTTPClient = &http.Client{
-		Transport: authTransport,
-	}
+	configuration.HTTPClient = standardClient
 	configuration.AddDefaultHeader("X-SOURCE", "API")
+	configuration.AddDefaultHeader("X-CORRELATION-ID", CORRELATION_ID)
 	configuration.Servers = securecabinetv1.ServerConfigurations{
 		{
 			URL:         "https://api.equinix.com",
@@ -55,7 +72,7 @@ func main() {
 	client := securecabinetv1.NewAPIClient(configuration)
 
 	// Call the availability endpoint
-	fmt.Printf("Checking Secure Cabinet availability for account: %s\n", accountNumber)
+	log.Printf("Checking Secure Cabinet availability for account: %s", accountNumber)
 
 	availability, resp, err := client.AvailabilityApi.GetProductsAvailability(ctx, accountNumber).Execute()
 	if err != nil {
@@ -68,32 +85,45 @@ func main() {
 	}
 
 	// Print the results
-	fmt.Printf("\nFound %d IBX locations with Secure Cabinet availability:\n\n", len(availability))
+	log.Printf("Found %d IBX locations with Secure Cabinet availability", len(availability))
 
-	for _, product := range availability {
-		fmt.Printf("IBX: %s\n", product.GetIbx())
-		fmt.Printf("  Max cabinets per order: %d\n", product.GetMaximumNumberOfCabinetsToOrder())
-		fmt.Printf("  Min power draw per cabinet: %.2f kW\n", product.GetMinimumDrawCapacityPerCabinet())
-		fmt.Printf("  Max power draw per cabinet: %.2f kW\n", product.GetMaximumDrawCapacityPerCabinet())
+	// Collect formatted output
+	var output []string
+	for _, ibxAvailability := range availability {
+		output = append(output, fmt.Sprintf("IBX: %s", ibxAvailability.GetIbx()))
+		output = append(output, fmt.Sprintf("  Max cabinets per order: %d", ibxAvailability.GetMaximumNumberOfCabinetsToOrder()))
+		output = append(output, fmt.Sprintf("  Min power draw per cabinet: %.2f kW", ibxAvailability.GetMinimumDrawCapacityPerCabinet()))
+		output = append(output, fmt.Sprintf("  Max power draw per cabinet: %.2f kW", ibxAvailability.GetMaximumDrawCapacityPerCabinet()))
 
-		dimensions := product.GetCabinetDimensions()
-		fmt.Printf("  Cabinet dimensions:\n")
-		fmt.Printf("    Width: %d %s\n", dimensions.Width.GetValue(), dimensions.Width.GetUnit())
-		fmt.Printf("    Depth: %d %s\n", dimensions.Depth.GetValue(), dimensions.Depth.GetUnit())
-		fmt.Printf("    Height: %d %s\n", dimensions.Height.GetValue(), dimensions.Height.GetUnit())
+		dimensions := ibxAvailability.GetCabinetDimensions()
+		output = append(output, "  Cabinet dimensions:")
+		output = append(output, fmt.Sprintf("    Width: %d %s", dimensions.Width.GetValue(), dimensions.Width.GetUnit()))
+		output = append(output, fmt.Sprintf("    Depth: %d %s", dimensions.Depth.GetValue(), dimensions.Depth.GetUnit()))
+		output = append(output, fmt.Sprintf("    Height: %d %s", dimensions.Height.GetValue(), dimensions.Height.GetUnit()))
 
-		if pdu, ok := product.GetPduConfigurationOk(); ok && pdu != nil {
-			fmt.Printf("  PDU available: Yes\n")
+		if pdu, ok := ibxAvailability.GetPduConfigurationOk(); ok && pdu != nil {
+			output = append(output, "  PDU available: Yes")
 		} else {
-			fmt.Printf("  PDU available: No\n")
+			output = append(output, "  PDU available: No")
 		}
 
-		if fabric, ok := product.GetFabricPortSpeedOk(); ok && fabric != nil {
-			fmt.Printf("  Fabric port available: Yes\n")
+		if fabric, ok := ibxAvailability.GetFabricPortSpeedOk(); ok && fabric != nil {
+			output = append(output, "  Fabric port available: Yes")
 		} else {
-			fmt.Printf("  Fabric port available: No\n")
+			output = append(output, "  Fabric port available: No")
 		}
 
-		fmt.Println()
+		output = append(output, "") // Empty line between IBX entries
+	}
+
+	// Limit output to first 30 lines to avoid flooding logs with availability data
+	maxLines := 30
+	if len(output) > maxLines {
+		log.Printf("Showing first %d lines of availability data (total lines: %d):", maxLines, len(output))
+		log.Println(strings.Join(output[:maxLines], "\n"))
+		log.Printf("... truncated %d lines to keep logs readable", len(output)-maxLines)
+	} else {
+		log.Println("Availability data:")
+		log.Println(strings.Join(output, "\n"))
 	}
 }
